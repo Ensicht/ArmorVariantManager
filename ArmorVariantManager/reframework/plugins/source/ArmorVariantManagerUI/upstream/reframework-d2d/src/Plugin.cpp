@@ -1,10 +1,13 @@
 #define NOMINMAX
 #include <algorithm>
 #include <chrono>
+#include <cwctype>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <d2d1helper.h>
+#include <TlHelp32.h>
 
 #include "reframework/API.hpp"
 #include "sol/sol.hpp"
@@ -32,18 +35,49 @@ struct Plugin {
     std::string last_script_error{};
     // 外部 reframework-d2d 存在时只保留输入桥接，不创建第二套渲染器。
     bool external_d2d{};
+    Clock::time_point next_external_d2d_scan{};
 };
 
 Plugin* g_plugin{};
 
-// 通过模块名检测外部 D2D，避免依赖 REFramework 插件加载顺序。
+// 枚举当前进程已加载的模块，兼容 reframework-d2d.dll、reframework-d2d(-xxxxx).dll 等变体。
 bool is_external_d2d_loaded() {
-    return GetModuleHandleW(L"reframework-d2d.dll") != nullptr;
+    constexpr std::wstring_view prefix{L"reframework-d2d"};
+    constexpr std::wstring_view extension{L".dll"};
+
+    const HANDLE snapshot = CreateToolhelp32Snapshot(
+        TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
+    if (snapshot == INVALID_HANDLE_VALUE) return false;
+
+    MODULEENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    bool found = false;
+    if (Module32FirstW(snapshot, &entry)) {
+        do {
+            std::wstring module_name{entry.szModule};
+            std::transform(module_name.begin(), module_name.end(), module_name.begin(),
+                [](wchar_t value) { return static_cast<wchar_t>(std::towlower(value)); });
+            if (module_name.starts_with(prefix) && module_name.ends_with(extension)) {
+                found = true;
+                break;
+            }
+        } while (Module32NextW(snapshot, &entry));
+    }
+
+    CloseHandle(snapshot);
+    return found;
 }
 
 // 外部 D2D 后加载时，立即停用本 DLL 的渲染资源，避免两个 renderer 同时操作 SwapChain。
 bool disable_embedded_backend_if_external() {
-    if (g_plugin->external_d2d || !is_external_d2d_loaded()) return g_plugin->external_d2d;
+    if (g_plugin->external_d2d) return true;
+
+    // 渲染回调每帧都会进入这里；模块快照只用于兼容外部插件晚加载，因此限制为每秒一次。
+    const auto now = Clock::now();
+    if (now < g_plugin->next_external_d2d_scan) return false;
+    g_plugin->next_external_d2d_scan = now + std::chrono::seconds{1};
+    if (!is_external_d2d_loaded()) return false;
+
     g_plugin->external_d2d = true;
     g_plugin->drawlist.acquire().commands.clear();
     g_plugin->d2d = nullptr;
