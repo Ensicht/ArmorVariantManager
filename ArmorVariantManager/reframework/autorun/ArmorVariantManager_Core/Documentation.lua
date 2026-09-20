@@ -184,6 +184,12 @@ return {
         title = "更新日志",
         entries = {
             {
+                title = "V4.2.2",
+                paragraphs = {
+                    "兼容一些同样基于refd2d的MOD。"
+                }
+            },
+            {
                 title = "V4.2.1",
                 paragraphs = {
                     "1. 修复还原备份功能失效的问题：mod 管理器重装后主配置被删除或替换时，不再漏掉还原提示。",
@@ -294,6 +300,12 @@ return {
         en = {
             title = "Changelog",
             entries = {
+                {
+                    title = "V4.2.2",
+                    paragraphs = {
+                        "Added compatibility with other mods that also use refd2d."
+                    }
+                },
                 {
                     title = "V4.2.1",
                     paragraphs = {
