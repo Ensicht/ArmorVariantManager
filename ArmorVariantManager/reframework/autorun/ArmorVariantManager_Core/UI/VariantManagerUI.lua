@@ -135,6 +135,7 @@ function VariantManagerUI.new(deps)
         number_inputs = {},
         number_editing = nil,
         frame_mouse_wheel = 0,
+        draw_mouse_wheel = 0,
         native_text_input = NativeTextInput.new({
             client_id = bridge_client_id,
             runtime_directory = bridge_paths.runtime_directory
@@ -233,6 +234,9 @@ function VariantManagerUI:ensure_d2d_backend()
                 end
                 return tostring(draw_error)
             end)
+            -- 绘制异常也必须释放快照，下一游戏帧才能采集到新的鼠标位置。
+            Runtime.end_input_frame()
+            self.draw_mouse_wheel = 0
             if not ok then
                 self.last_error = err
                 if log and log.error then
@@ -626,6 +630,7 @@ end
 
 -- 场景切换只取消尚未执行的UI操作，不删除配置；防止旧弹窗闭包作用到新角色。
 function VariantManagerUI:invalidate_context()
+    Runtime.reset_pending_input()
     self.pending_group, self.pending_group_create, self.pending_group_delete = nil, nil, nil
     self.group_creation_mode = false
     self.pending_material_selections = {}
@@ -643,6 +648,7 @@ function VariantManagerUI:set_suspended(suspended)
     if self.suspended == suspended then return end
     self.suspended = suspended
     if suspended then
+        Runtime.reset_pending_input()
         if self.input_blocker and self.input_blocker.enabled then self.input_blocker:set_enabled(false) end
         self:deactivate_native_text_input()
         self:reset_text_input_state()
@@ -661,6 +667,7 @@ function VariantManagerUI:update()
     self:ensure_d2d_backend()
     -- 配置关闭时保持最短路径；不进入异常保护、快捷键查询或输入对象访问。
     if not config.new_ui_enabled then
+        Runtime.reset_pending_input()
         self:deactivate_native_text_input()
         if self.input_blocker and self.input_blocker.enabled then
             self.input_blocker:set_enabled(false)
@@ -742,7 +749,12 @@ function VariantManagerUI:update()
             self.visible = not self.visible
         end
         self.key_down = down
-        if not self.visible then self:deactivate_native_text_input() end
+        if not self.visible then
+            self:deactivate_native_text_input()
+            Runtime.reset_pending_input()
+        elseif self.ready then
+            Runtime.capture_input()
+        end
 
         if self.visible and not self.input_blocker then
             -- 只有用户真正打开弹窗后才安装输入拦截 Hook。
@@ -762,7 +774,10 @@ function VariantManagerUI:update()
         -- 在帧更新阶段缓存游戏的真实滚轮增量，避免 d2d 回调阶段错过本帧事件。
         if self.visible and self.input_blocker then
             local wheel_ok, wheel = pcall(function() return self.input_blocker:get_mouse_wheel() end)
-            self.frame_mouse_wheel = wheel_ok and type(wheel) == "number" and wheel or 0
+            -- 和点击一样累计到下一次绘制，不能被没有滚轮输入的游戏帧覆盖。
+            if wheel_ok and type(wheel) == "number" then
+                self.frame_mouse_wheel = self.frame_mouse_wheel + wheel
+            end
         else
             self.frame_mouse_wheel = 0
         end
@@ -951,7 +966,7 @@ function VariantManagerUI:draw_library(x, y, w, h, context, preset_w)
     self.list:draw(groups, x + LAYOUT.panel_inset, y, w - LAYOUT.panel_inset * 2, h, {
         key = "groups:" .. tostring(context.weapon_mode and "weapon" or "armor") .. ":"
             .. tostring(context.body_id or ""),
-        wheel = self.frame_mouse_wheel,
+        wheel = self.draw_mouse_wheel,
         top_padding = LAYOUT.panel_inset + LAYOUT.title_height,
         bottom_padding = LAYOUT.group_actions_height,
         row_gap = LAYOUT.list_gap,
@@ -1020,7 +1035,7 @@ function VariantManagerUI:draw_library(x, y, w, h, context, preset_w)
     self.list:draw(presets, preset_x + LAYOUT.panel_inset, y, preset_w - LAYOUT.panel_inset * 2, h, {
         key = "presets:" .. tostring(context.weapon_mode and "weapon" or "armor") .. ":"
             .. tostring(context.body_id or "") .. ":" .. tostring(context.group_name or ""),
-        wheel = self.frame_mouse_wheel,
+        wheel = self.draw_mouse_wheel,
         top_padding = LAYOUT.panel_inset + LAYOUT.title_height + warning_height,
         bottom_padding = LAYOUT.preset_actions_height,
         row_gap = LAYOUT.list_gap,
@@ -1234,7 +1249,7 @@ function VariantManagerUI:draw_part_content(x, y, w, h, context, part_index)
     local viewport_w = w - LAYOUT.panel_inset * 2
     if count > max_rows then
         if Runtime.point_in_rect(mx, my, x, viewport_y, viewport_w, viewport_h) then
-            local wheel = self.frame_mouse_wheel
+            local wheel = self.draw_mouse_wheel
             if wheel ~= 0 then
                 self.material_offset = math.max(0, math.min(max_offset,
                     self.material_offset - math.floor(wheel * 3)))
@@ -1758,10 +1773,10 @@ function VariantManagerUI:draw_transform_panel(x, y, w, h, context)
     if self.transform_max_scroll > 0
         and Runtime.point_in_rect(mx, my, right_x, view_top, right_width,
         math.max(0, view_bottom - view_top))
-        and self.frame_mouse_wheel ~= 0 then
+        and self.draw_mouse_wheel ~= 0 then
         -- 条件区按一行内容滚动，避免当前每次滚轮只移动几个像素。
         self.transform_scroll_offset = math.max(0, math.min(self.transform_max_scroll,
-            self.transform_scroll_offset - self.frame_mouse_wheel * 90))
+            self.transform_scroll_offset - self.draw_mouse_wheel * 90))
     end
     local cursor_y = view_top + 8 - self.transform_scroll_offset
     local content_start = cursor_y
@@ -1934,9 +1949,9 @@ function VariantManagerUI:draw_documentation_panel(x, y, w, h)
     if self.documentation_max_scroll > 0
         and Runtime.point_in_rect(mx, my, x + LAYOUT.panel_inset, view_top,
             w - LAYOUT.panel_inset * 2, view_height)
-        and self.frame_mouse_wheel ~= 0 then
+        and self.draw_mouse_wheel ~= 0 then
         self.documentation_scroll_offset = math.max(0, math.min(self.documentation_max_scroll,
-            self.documentation_scroll_offset - self.frame_mouse_wheel * 90))
+            self.documentation_scroll_offset - self.draw_mouse_wheel * 90))
     end
 
     local text_x = x + LAYOUT.panel_inset
@@ -2177,6 +2192,8 @@ function VariantManagerUI:draw()
     local raw_sw, raw_sh = self.d2d.surface_size()
     if not raw_sw or not raw_sh or raw_sw < 320 or raw_sh < 240 then return end
     Runtime.begin_input_frame()
+    -- 本次绘制消费已累计滚轮；之后游戏帧采集的新增量留给下一次绘制。
+    self.draw_mouse_wheel, self.frame_mouse_wheel = self.frame_mouse_wheel, 0
     local sw, sh = raw_sw / scale, raw_sh / scale
     local mx, my = Runtime.mouse_position()
     local raw_mx, raw_my = Runtime.raw_mouse_position()
@@ -2419,6 +2436,7 @@ function VariantManagerUI:draw()
             end
         end
     end
+    self.draw_mouse_wheel = 0
     Runtime.end_input_frame()
 
 end

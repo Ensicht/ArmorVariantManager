@@ -3,6 +3,35 @@ local Runtime = {}
 -- 弹窗整体缩放时，组件继续使用逻辑坐标；鼠标读取统一反向换算。
 Runtime.ui_scale = 1
 Runtime.frame_input = nil
+local input_sampled = false
+local mouse_was_down = false
+local pending_clicks = {}
+local click_head, click_tail = 1, 0
+
+-- 弹窗关闭、暂停或切换角色时丢弃旧事件，避免恢复后误点新界面。
+function Runtime.reset_pending_input()
+    if click_tail > 0 then pending_clicks = {} end
+    click_head, click_tail = 1, 0
+    input_sampled, mouse_was_down = false, false
+    Runtime.frame_input = nil
+end
+
+-- 游戏帧和D2D刷新频率不同：每个游戏帧采集点击，直到绘制回调消费才移除。
+-- 同时保存按下位置，避免等待绘制期间鼠标移动后误点另一个控件。
+function Runtime.capture_input()
+    local down_ok, down = pcall(function() return imgui.is_mouse_down(0) end)
+    down = down_ok and down == true
+    local clicked_ok, clicked = pcall(function() return imgui.is_mouse_clicked(0) end)
+    -- 首次采样只建立按下基线，打开弹窗时已按住的左键不能成为一次新点击。
+    if input_sampled and ((clicked_ok and clicked == true) or (down and not mouse_was_down)) then
+        local x, y = Runtime.raw_mouse_position()
+        if x >= 0 and y >= 0 then
+            click_tail = click_tail + 1
+            pending_clicks[click_tail] = { x = x, y = y }
+        end
+    end
+    input_sampled, mouse_was_down = true, down
+end
 
 function Runtime.set_ui_scale(scale)
     Runtime.ui_scale = math.max(0.01, tonumber(scale) or 1)
@@ -97,14 +126,30 @@ function Runtime.begin_input_frame()
     local raw_x, raw_y = Runtime.raw_mouse_position()
     local mouse_x, mouse_y = Runtime.mouse_position()
     local down_ok, down = pcall(function() return imgui.is_mouse_down(0) end)
-    local clicked_ok, clicked = pcall(function() return imgui.is_mouse_clicked(0) end)
+    local clicked = false
+    if input_sampled then
+        -- 每次绘制最多消费一次点击；快速连点保留顺序，不能折叠成一个布尔值。
+        local event = pending_clicks[click_head]
+        if event then
+            pending_clicks[click_head] = nil
+            click_head = click_head + 1
+            raw_x, raw_y = event.x, event.y
+            mouse_x, mouse_y = Runtime.to_logical_point(raw_x, raw_y)
+            clicked = true
+            if click_head > click_tail then click_head, click_tail = 1, 0 end
+        end
+    else
+        -- 组件库独立使用、未开启游戏帧采样时保留原有接口行为。
+        local clicked_ok, value = pcall(function() return imgui.is_mouse_clicked(0) end)
+        clicked = clicked_ok and value == true
+    end
     Runtime.frame_input = {
         raw_x = raw_x,
         raw_y = raw_y,
         mouse_x = mouse_x,
         mouse_y = mouse_y,
         mouse_down = down_ok and down == true or false,
-        mouse_clicked = clicked_ok and clicked == true or false
+        mouse_clicked = clicked
     }
 end
 
