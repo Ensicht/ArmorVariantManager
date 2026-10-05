@@ -76,6 +76,122 @@ end
 -- =============================================================================
 local last_state_cache = {}
 
+-- 规则摘要仅依赖配置，不持有角色对象；弱键允许已替换的配置随原表释放。
+local config_rule_cache = setmetatable({}, { __mode = "k" })
+local rule_fields = {
+    hp = "transform_rules",
+    damage = "damage_transform_rules",
+    weapon = "weapon_transform_rules",
+    spirit = "spirit_transform_rules",
+    dual_blades = "dual_blades_transform_rules",
+    switch_axe = "switch_axe_transform_rules",
+    insect_glaive = "insect_glaive_transform_rules",
+    charge_blade = "charge_blade_transform_rules",
+    greatsword_type = "greatsword_type_transform_rules",
+    greatsword_level = "greatsword_level_transform_rules",
+    bow_level = "bow_level_transform_rules",
+    hammer_level = "hammer_level_transform_rules"
+}
+local weapon_type_required = {
+    spirit = 3,           -- 太刀
+    dual_blades = 2,      -- 双刀
+    switch_axe = 8,       -- 斩斧
+    insect_glaive = 10,   -- 虫棍
+    charge_blade = 9,     -- 盾斧
+    greatsword_type = 0,  -- 大剑
+    greatsword_level = 0, -- 大剑
+    bow_level = 11,       -- 弓箭
+    hammer_level = 4      -- 大锤
+}
+
+-- 空节点、未选择预设和已删除的目标不需要监测；空预设表仍是有效的用户配置。
+local function has_configured_target(config, targets)
+    if type(targets) ~= "table" then return false end
+    for _, target in ipairs(targets) do
+        if type(target) == "table" and type(target.preset) == "string"
+            and target.preset ~= "" and target.preset ~= "None" then
+            local group_name = target.group or ""
+            local owner = group_name == "" and config or
+                (type(config.groups) == "table" and config.groups[group_name])
+            if type(owner) == "table" and type(owner.presets) == "table"
+                and type(owner.presets[target.preset]) == "table" then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- 受击链只使用 chain_nodes 的目标，其余模式使用规则本身的目标。
+local function has_configured_rule(config, type_key, rule)
+    if type(rule) ~= "table" then return false end
+    if type_key == "damage" and rule.mode == 3 then
+        if type(rule.chain_nodes) ~= "table" then return false end
+        for _, node in pairs(rule.chain_nodes) do
+            if type(node) == "table" and has_configured_target(config, node.targets) then return true end
+        end
+        return false
+    end
+    return has_configured_target(config, rule.targets)
+end
+
+-- 加载、保存或恢复配置时重新计算一次；不读文件、不访问 SDK，也不修改原配置。
+function TransformManager.refresh_config_rules(config)
+    if type(config) ~= "table" then return nil end
+    local summary = { conditions = {}, has_rules = false, needs_weapon_type = false }
+    for type_key, field in pairs(rule_fields) do
+        local setting = type(config.parallel_settings) == "table" and config.parallel_settings[type_key]
+        local enabled = config.is_parallel and type(setting) == "table" and setting.enabled
+            or not config.is_parallel and config.transform_type == type_key
+        local rules = config[field]
+        local configured = false
+        if enabled and type(rules) == "table" then
+            if type_key == "damage" then
+                -- 与受击模块一致，只使用 pairs 返回的第一条规则。
+                for _, rule in pairs(rules) do
+                    configured = has_configured_rule(config, type_key, rule)
+                    break
+                end
+            else
+                for _, rule in ipairs(rules) do
+                    if has_configured_rule(config, type_key, rule) then configured = true; break end
+                end
+            end
+        end
+        if configured then
+            summary.conditions[type_key] = true
+            summary.has_rules = true
+            if weapon_type_required[type_key] ~= nil then summary.needs_weapon_type = true end
+        end
+    end
+    config_rule_cache[config] = summary
+    return summary
+end
+
+local function get_config_rules(config)
+    if type(config) ~= "table" then return nil end
+    return config_rule_cache[config] or TransformManager.refresh_config_rules(config)
+end
+
+function TransformManager.has_configured_rules(config)
+    local summary = get_config_rules(config)
+    return summary ~= nil and summary.has_rules
+end
+
+function TransformManager.has_configured_condition(config, type_key)
+    local summary = get_config_rules(config)
+    return summary ~= nil and summary.conditions[type_key] == true
+end
+
+-- 旧 UI 按摘要读取状态，新 UI 使用同一摘要判断；false 是有效的收刀状态，不能丢失。
+function TransformManager.get_configured_state(config, type_key, character, char_addr)
+    if not TransformManager.has_configured_condition(config, type_key) then return nil end
+    if type_key == "damage" then return ConditionRegistry.damage.get_remaining_time(char_addr) end
+    local handler = ConditionRegistry[type_key]
+    if handler and handler.get_state then return handler.get_state(character) end
+    return nil
+end
+
 function TransformManager.clear_last_state_cache()
     last_state_cache = {}
 end
@@ -91,32 +207,23 @@ local function get_active_rule_for_type(t_type, config, character, char_addr)
 end
 
 function TransformManager.apply_transform_rules(char_addr, config, character, active_overrides, merge_overrides)
-    if not active_overrides then return active_overrides, false end
-    
-    -- 武器类型映射表：条件类型 -> 所需的 WeaponType 值
-    local weapon_type_required = {
-        spirit = 3,           -- 太刀
-        dual_blades = 2,      -- 双刀
-        switch_axe = 8,       -- 斩斧
-        insect_glaive = 10,   -- 虫棍
-        charge_blade = 9,     -- 盾斧
-        greatsword_type = 0,  -- 大剑
-        greatsword_level = 0, -- 大剑
-        bow_level = 11,       -- 弓箭
-        hammer_level = 4,     -- 大锤
-    }
-    
-    local current_weapon_type = TransformManager.get_character_weapon_type(character)
+    if not active_overrides then return active_overrides, false, nil, nil end
+    local summary = get_config_rules(config)
+    if not summary or not summary.has_rules then return active_overrides, false, nil, nil end
+
+    -- 只有已配置的武器专属条件才需要查询武器类型，纯血量/受击/收刀规则不查询。
+    local current_weapon_type = nil
+    if summary.needs_weapon_type then
+        current_weapon_type = TransformManager.get_character_weapon_type(character)
+    end
     
     local active_rules = {} -- 收集所有激活的规则，格式: { rule = node, priority = number }
     local current_states = {} -- 记录每个条件类型的当前状态，用于缓存比对
     
-    if not config then return active_overrides, false end
-    
     if config.is_parallel then
         -- 并行模式：遍历所有启用的条件类型
         for t_type, p_setting in pairs(config.parallel_settings) do
-            if p_setting.enabled then
+            if summary.conditions[t_type] then
                 -- 检查武器类型匹配性
                 local required = weapon_type_required[t_type]
                 if required and current_weapon_type ~= required then
@@ -134,7 +241,7 @@ function TransformManager.apply_transform_rules(char_addr, config, character, ac
     else
         -- 单一模式：只评估当前选中的条件类型
         local t_type = config.transform_type
-        if t_type then
+        if summary.conditions[t_type] then
             local required = weapon_type_required[t_type]
             if not (required and current_weapon_type ~= required) then
                 local rule, cur_state = get_active_rule_for_type(t_type, config, character, char_addr)
