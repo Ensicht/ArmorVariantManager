@@ -1,8 +1,8 @@
 local mod_name = "ArmorVariantManager"
 -- 开发中遵守
 -- 版本号-开发状态-开发状态标识
-local version = "4.2.2"
-local author = "MK,Moon,AZUSA"
+local version = "4.3.0"
+local author = "MK,Moon,AZUSA,Ensicht"
 
 -- =============================================================================
 -- 多语言与全局配置系统

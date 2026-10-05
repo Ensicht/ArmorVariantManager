@@ -184,6 +184,14 @@ return {
         title = "更新日志",
         entries = {
             {
+                title = "V4.3.0",
+                paragraphs = {
+                    "1. 性能优化：增加场景切换保护，重做扫描缓存失效处理等。",
+                    "2. 修复一些BUG。",
+                    "3. 修复UI弹窗在高帧率时点击会无效的问题。"
+                }
+            },
+            {
                 title = "V4.2.2",
                 paragraphs = {
                     "兼容一些同样基于refd2d的MOD。"
@@ -300,6 +308,14 @@ return {
         en = {
             title = "Changelog",
             entries = {
+                {
+                    title = "V4.3.0",
+                    paragraphs = {
+                        "1. Performance improvements: added scene transition protection, reworked scan cache invalidation, and more.",
+                        "2. Fixed several bugs.",
+                        "3. Fixed clicks in the UI panel sometimes not registering at high frame rates."
+                    }
+                },
                 {
                     title = "V4.2.2",
                     paragraphs = {
