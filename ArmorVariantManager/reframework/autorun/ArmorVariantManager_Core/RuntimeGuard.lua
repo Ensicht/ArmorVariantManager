@@ -11,7 +11,7 @@ function RuntimeGuard.new(clear_runtime)
     local flow_type = sdk.find_type_definition("app.GameFlowManager")
     local loading_getter = flow_type and (flow_type:get_method("get_Loading") or flow_type:get_method("get_Loading()"))
 
-    -- 与稳定自改版相同：只在过渡期间或已有扫描批次处读取场景原生地址。
+    -- 只在场景过渡期间或已有扫描批次中读取场景原生地址，避免正常帧重复查询。
     function guard:get_scene()
         if not scene_type then return nil, "" end
         local ok, scene, key = pcall(function()
