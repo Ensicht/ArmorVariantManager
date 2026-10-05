@@ -624,8 +624,38 @@ function VariantManagerUI:is_bindable_key(key)
     return type(key) == "number" and not (key >= 0x01 and key <= 0x06)
 end
 
+-- 场景切换只取消尚未执行的UI操作，不删除配置；防止旧弹窗闭包作用到新角色。
+function VariantManagerUI:invalidate_context()
+    self.pending_group, self.pending_group_create, self.pending_group_delete = nil, nil, nil
+    self.group_creation_mode = false
+    self.pending_material_selections = {}
+    self.material_filter_editing, self.preset_name_editing, self.group_name_editing = false, false, false
+    self.number_editing = nil
+    if self.select then
+        self.select.open_key, self.select.active_request = nil, nil
+        self.select.changed_key, self.select.changed_value, self.select.changed_index = nil, nil, nil
+    end
+end
+
+-- 暂停切入只释放一次本UI的输入占用；菜单暂停保留用户选择及运行缓存。
+function VariantManagerUI:set_suspended(suspended)
+    suspended = suspended == true
+    if self.suspended == suspended then return end
+    self.suspended = suspended
+    if suspended then
+        if self.input_blocker and self.input_blocker.enabled then self.input_blocker:set_enabled(false) end
+        self:deactivate_native_text_input()
+        self:reset_text_input_state()
+        self.frame_mouse_wheel = 0
+    else
+        -- 恢复时忽略仍按住的快捷键，释放后才允许下一次切换。
+        self.key_down = true
+    end
+end
+
 -- 每帧处理新 UI 快捷键，只在按下沿切换窗口可见状态。
 function VariantManagerUI:update()
+    if self.deps.is_suspended and self.deps.is_suspended() then self:set_suspended(true); return end
     local config = self.deps.config
     -- 外部 reframework-d2d 可能在本脚本之后才创建全局 d2d，首次帧更新时补注册。
     self:ensure_d2d_backend()
@@ -2137,6 +2167,7 @@ end
 
 -- 绘制新 UI 弹窗和右上角入口。
 function VariantManagerUI:draw()
+    if self.suspended or (self.deps.is_suspended and self.deps.is_suspended()) then return end
     local config = self.deps.config
     -- 关闭弹窗时完全跳过 d2d 表面绘制；快捷键仍由 update() 负责监听。
     -- 右上角入口会强制每帧执行 d2d 绘制，持续存在时会显著降低游戏帧率。

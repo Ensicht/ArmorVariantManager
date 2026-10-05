@@ -25,6 +25,7 @@ local global_config = {
 -- 本地化字典 (从外部模块加载)
 local Localization = require("ArmorVariantManager_Core.Localization")
 local TransformManager = require("ArmorVariantManager_Core.TransformManager")
+local RuntimeGuard = require("ArmorVariantManager_Core.RuntimeGuard")
 -- REFramework 重载脚本时可能保留 Lua 模块缓存，新UI必须重新加载最新实现。
 local refd2d_module_names = {
     "ArmorVariantManager_Core.UI.VariantManagerUI",
@@ -233,6 +234,24 @@ local active_overrides = {} -- 记录当前生效的配置状态 (BodyID -> { [p
 -- 记录各分组当前选中的预设名 (BodyID -> { [""] = "主列表预设名", ["分组名"] = "预设名" })
 -- 用于全局分组切换时全量重算，确保其他分组的当前预设也一起被应用
 local active_group_presets = {}
+local transform_player_characters = {}
+local runtime_guard, variant_manager_ui
+
+-- 只接受本轮PlayerManager提供的真实玩家；不以外观ID或猎人骨架猜测NPC身份。
+local function can_use_transform(character)
+    return not runtime_guard.suspended and character ~= nil
+        and transform_player_characters[tostring(character)] == true
+end
+
+-- 先查配置摘要，无目标时连角色地址也不读取；六处入口保留玩家过滤及四返回值。
+local function apply_transform_rules_for_character(config, character, overrides, merge_fn)
+    if not TransformManager.has_configured_rules(config) or not can_use_transform(character) then
+        return overrides, false, nil, nil
+    end
+    local game_object = safe_get_game_object(character, "transform_rules")
+    local char_addr = tostring(game_object or character)
+    return TransformManager.apply_transform_rules(char_addr, config, character, overrides, merge_fn)
+end
 
 -- 记录配置是否被外部还原 (BodyID -> true)
 -- 检测原理：插件在玩家保存时会同时写主配置和备份(backup/)，两者此刻内容一致；
@@ -651,6 +670,10 @@ end
 -- =============================================================================
 -- 角色扫描与缓存
 -- =============================================================================
+-- 派生自游戏对象的缓存必须先声明，后面的清理函数才能访问同一份局部表。
+local character_mesh_cache = {}
+local applied_parts_cache = {} -- Key: char GameObject Address, Value: { [part_index] = state_hash }
+local applied_weapon_cache = {} -- Key: char GameObject Address, Value: state_hash
 -- 辅助函数：获取场景中所有有效的玩家角色
 -- 引入缓存机制以防止列表闪烁 (仅用于主菜单)
 local character_cache = {} -- Key: GameObject Address, Value: { char: userdata, last_seen: number }
@@ -659,13 +682,9 @@ local CACHE_TTL_BUFFER = 10.0 -- 缓存过期时间的缓冲值 (秒)，设置�
 -- 旧场景销毁后原生对象立即失效，但上面的缓存 TTL 仍会让这些引用多存活十多秒，
 -- 期间每次访问都会抛出 InvalidOperationException 并写入大量错误日志。
 -- 因此场景一变就整体作废缓存，而不是等 TTL 自然过期。
-local current_scene_addr = nil
 local last_valid_local_player = nil -- 记录上一个有效的本地玩家角色
 local last_valid_local_player_time = 0 -- 记录上一个有效角色的时间戳
 local PLAYER_PERSISTENCE_TIME = 1.0 -- UI 层面的角色保持宽限期 (秒)
-
-local SAFE_LIVENESS_BATCH_SIZE = 32 -- 实测确认对象仍存活前，单个 on_frame 内允许处理的最大数量，避免重建帧整批报错
-local scene_reset_pending = false -- 场景纪元失效后需要整体清空缓存的标记
 
 -- 扫描器状态 (用于分帧处理)
 local scanner = {
@@ -673,50 +692,46 @@ local scanner = {
     transforms = nil, -- 待处理的 Transforms 列表
     count = 0,
     index = 1,
-    safe_batch_remaining = math.huge, -- 本帧剩余可安全处理的 Transform 数量
+    scene_key = "",
+    generation = 0,
+    force_rescan = false,
     -- batch_size 已移至全局配置 global_config.scanner_batch_size
     last_scan_time = 0
 }
 
--- 场景切换检测：via.Scene 原生指针变化即视为换场景。
--- 返回 true 表示本帧刚完成一次缓存作废，调用方应跳过本帧的旧缓存使用。
-local function check_scene_change(scene)
-    local addr = scene and tostring(scene) or "none"
-    if addr == current_scene_addr then return false end
-    current_scene_addr = addr
-    -- 旧场景引用立即作废：不保留任何跨场景的原生对象引用。
+-- 换场景后作废"派生自游戏对象"的状态。不触碰纯 JSON 配置缓存：
+-- loaded_configs 是文件配置，active_overrides / active_group_presets / current_config
+-- 等是用户编辑状态，都没有原生对象引用，清空反而会造成预设显示丢失。
+local function flush_scene_reset(reset_dead_marks)
     scanner.state = "IDLE"
     scanner.transforms = nil
     scanner.count = 0
     scanner.index = 1
-    scanner.safe_batch_remaining = math.huge
+    scanner.scene_key = ""
+    scanner.force_rescan = true
     character_cache = {}
     body_id_cache = {}
-    character_mesh_cache = {}
-    applied_parts_cache = {}
-    applied_weapon_cache = {}
-    loaded_configs = {}
-    last_valid_local_player = nil
-    -- 标记延迟到帧末执行：那时文件内所有局部表都已初始化，可整体清空而不依赖声明顺序。
-    scene_reset_pending = true
-    return true
-end
-
--- 换场景后作废"派生自游戏对象"的状态。不触碰纯 JSON 配置缓存：
--- loaded_configs 是文件配置，active_overrides / active_group_presets / current_config
--- 等是用户编辑状态，都没有原生对象引用，清空反而会造成预设显示丢失。
-local function flush_scene_reset()
-    character_cache = {}
-    body_id_cache = {}
+    weapon_id_cache = {}
     character_mesh_cache = {}
     applied_parts_cache = {}
     applied_weapon_cache = {}
     last_valid_local_player = nil
+    last_valid_local_player_time = 0
+    transform_player_characters = {}
     -- 换场景后旧的"已销毁"标记不再适用，清空以免误伤新场景复用的地址。
-    clear_dead_object_marks()
+    if reset_dead_marks ~= false then clear_dead_object_marks() end
     if TransformManager and TransformManager.clear_last_state_cache then
         TransformManager.clear_last_state_cache()
     end
+    if variant_manager_ui then variant_manager_ui:invalidate_context() end
+end
+
+runtime_guard = RuntimeGuard.new(flush_scene_reset)
+
+-- 首错丢弃整份快照并终止本帧，下一帧可重扫；保留上游的死对象短期拒绝标记。
+local function discard_unreliable_scanner_snapshot()
+    flush_scene_reset(false)
+    runtime_guard:block_frame()
 end
 
 -- 更新单个角色的缓存。返回值 game_obj 为 nil 表示该包装对象已随场景销毁：
@@ -737,25 +752,21 @@ local function update_cache_entry(char)
     character_cache[key] = { char = char, last_seen = os.clock() }
 end
 
--- 分帧扫描器逻辑
-local function tick_scanner()
+-- 批次绑定Scene原生地址与代际；生命周期变化后不继续读取跨帧保存的旧Transform。
+local function scan_scene_batch()
     local current_time = os.clock()
     local scan_interval = global_config.scan_interval or 2.0
     if scanner.state == "IDLE" then
-        if (current_time - scanner.last_scan_time > scan_interval) then
+        if scanner.force_rescan or (current_time - scanner.last_scan_time > scan_interval) then
+            scanner.force_rescan = false
             -- 清理过期 Body ID 缓存
             local ttl = global_config.body_id_ttl or 1.0
             for k, v in pairs(body_id_cache) do
                 if current_time - v.last_check > ttl * 2 then body_id_cache[k] = nil end
             end
-            local scene_manager = sdk.get_native_singleton("via.SceneManager")
-            local scene = nil
-            if scene_manager then
-                scene = sdk.call_native_func(scene_manager, sdk.find_type_definition("via.SceneManager"), "get_CurrentScene")
-            end
+            local scene, scene_key = runtime_guard:get_scene()
             if scene then
-                -- 0. 场景切换检测：刚换场景时旧缓存全部作废，本帧不再使用它们。
-                check_scene_change(scene)
+                if not runtime_guard:accept_scene(scene_key) then return false end
                 -- 1. 扫描 app.Character (通常数量较少，一次性处理)
                 if type_cache.app_character then
                     local components = scene:call("findComponents(System.Type)", type_cache.app_character:get_runtime_type())
@@ -771,6 +782,8 @@ local function tick_scanner()
                         scanner.transforms = transforms:get_elements()
                         scanner.count = #scanner.transforms
                         scanner.index = 1
+                        scanner.scene_key = scene_key
+                        scanner.generation = runtime_guard.generation
                         scanner.state = "PROCESSING"
                     else
                         scanner.last_scan_time = current_time
@@ -783,20 +796,21 @@ local function tick_scanner()
             end
         end
     elseif scanner.state == "PROCESSING" then
+        local _, scene_key = runtime_guard:get_scene()
+        if scanner.generation ~= runtime_guard.generation or scene_key == ""
+            or scanner.scene_key ~= scene_key then
+            runtime_guard:accept_scene(scene_key)
+            discard_unreliable_scanner_snapshot()
+            return false
+        end
         -- 处理当前批次。
         -- 换装/换场景瞬间整批 Transform 可能同时失效，若一次处理 batch_size 个对象，
         -- 会连续抛出上百次 InvalidOperationException 并把日志刷满。
-        -- 因此：先用小步长试探，只有确认对象仍然存活才允许在本帧内放大到完整批大小；
-        -- 一旦出现死对象，本帧立即停止推进（index 不提交），留到下一帧重试。
+        -- 一旦出现死对象，立即停止本批次并放弃整份快照。
         local batch_size = global_config.scanner_batch_size or 100
-        if scanner.safe_batch_remaining <= 0 then
-            -- 本帧已达到安全处理上限，下一帧继续。
-            return
-        end
         local limit = scanner.index + batch_size - 1
         if limit > scanner.count then limit = scanner.count end
         local batch_dead = false
-        local processed = 0
         for i = scanner.index, limit do
             -- 防御性编程：使用 pcall 包裹对象的获取和有效性检查
             -- 防止因对象跨帧销毁导致的 sol: runtime error
@@ -814,6 +828,10 @@ local function tick_scanner()
                 end
                 -- 极速获取 Name (再次使用 pcall 确保安全)
                 local name_ok, name = pcall(method_cache.GameObject_get_Name.call, method_cache.GameObject_get_Name, game_obj)
+                if not name_ok then
+                    batch_dead = true
+                    break
+                end
                 -- 快速筛选
                 local is_target = false
                 if name_ok and name then
@@ -838,28 +856,25 @@ local function tick_scanner()
                     if type_cache.app_character then
                         -- 使用 pcall 包裹 getComponent
                         local char_ok, c = pcall(method_cache.GameObject_getComponent.call, method_cache.GameObject_getComponent, game_obj, type_cache.app_character)
-                        if char_ok then char = c end
+                        if not char_ok then discard_unreliable_scanner_snapshot(); return false end
+                        char = c
                     end
                     if not char and type_cache.app_hunter_character then
                         local char_ok, c = pcall(method_cache.GameObject_getComponent.call, method_cache.GameObject_getComponent, game_obj, type_cache.app_hunter_character)
-                        if char_ok then char = c end
+                        if not char_ok then discard_unreliable_scanner_snapshot(); return false end
+                        char = c
                     end
                     if char then update_cache_entry(char) else update_cache_entry(transform) end
                 end
-                processed = processed + 1
+            else
+                batch_dead = true
+                break
             end
         end
-        -- 本帧实际检查过的对象数量计入安全预算：未确认存活前不允许整批推进。
-        if processed > 0 and scanner.safe_batch_remaining ~= math.huge then
-            scanner.safe_batch_remaining = scanner.safe_batch_remaining - processed
-        end
         if batch_dead then
-            -- 出现已销毁对象：本帧不推进 index，下一帧从同一位置重试；
-            -- 若换装确实发生，下一次扫描会因为场景/对象重建而重建列表。
-            scanner.safe_batch_remaining = 0
-            return
+            discard_unreliable_scanner_snapshot()
+            return false
         end
-        scanner.safe_batch_remaining = math.huge
         scanner.index = limit + 1
         -- 检查是否完成
         if scanner.index > scanner.count then
@@ -868,9 +883,18 @@ local function tick_scanner()
             scanner.last_scan_time = os.clock()
         end
     end
+    return true
+end
+
+-- 场景采样/组件枚举也可能随销毁失败；只捕获本批次并作废，不带着旧缓存继续应用。
+local function tick_scanner()
+    local ok, ready = pcall(scan_scene_batch)
+    if not ok then discard_unreliable_scanner_snapshot(); return false end
+    return ready
 end
 
 local function get_all_characters()
+    transform_player_characters = {}
     local chars = {}
     local seen_objs = {} -- 用于去重，Key: GameObject Address
     if not type_player_manager then type_player_manager = get_type("app.PlayerManager") end
@@ -884,6 +908,7 @@ local function get_all_characters()
                 if player then
                     local char = player:call("get_Character")
                     if char and sdk.is_managed_object(char) then
+                        transform_player_characters[tostring(char)] = true
                         local game_obj_ok, game_obj = (function() local go = safe_get_game_object(char, "get_all_characters_instanced") if not go then return false end return true, go end)()
                         if game_obj_ok and game_obj and sdk.is_managed_object(game_obj) then
                             -- 检查角色是否被游戏原生隐藏 (例如在使用装备箱时)
@@ -910,6 +935,7 @@ local function get_all_characters()
         if master then
             local char = master:call("get_Character")
             if char and sdk.is_managed_object(char) then
+                transform_player_characters[tostring(char)] = true
                 local game_obj_ok, game_obj = (function() local go = safe_get_game_object(char, "get_all_characters_master") if not go then return false end return true, go end)()
                 if game_obj_ok and game_obj and sdk.is_managed_object(game_obj) then
                     local draw_status, is_draw = pcall(function() return game_obj:call("get_Draw") end)
@@ -967,7 +993,10 @@ local function get_local_player_character()
     local player_manager = get_player_manager()
     if player_manager then
         local master_player = player_manager:call("getMasterPlayer")
-        if master_player then char = master_player:call("get_Character") end
+        if master_player then
+            char = master_player:call("get_Character")
+            if char and sdk.is_managed_object(char) then transform_player_characters[tostring(char)] = true end
+        end
     end
     -- 2. 如果 PlayerManager 失败，尝试从缓存的角色列表中获取 (主菜单/过场)
     if not char then
@@ -1243,7 +1272,6 @@ end
 
 -- 辅助函数：获取角色对象树中的全部 Mesh，并在短时间内缓存结果
 -- 装备切换期间对象会重建，短 TTL 可以兼顾新对象发现和每帧性能。
-local character_mesh_cache = {}
 local CHARACTER_MESH_CACHE_TTL = 0.25
 local function get_all_character_meshes(character)
     if not character or not sdk.is_managed_object(character) then return {} end
@@ -1495,15 +1523,32 @@ local function is_globally_hidden(part_index, mat_name)
 end
 -- 预设应用函数
 -- =============================================================================
--- 用于记录角色部位上次应用时的状态哈希，避免每帧重复应用导致覆盖游戏的原生临时状态
-local applied_parts_cache = {} -- Key: char GameObject Address, Value: { [part_index] = state_hash }
-local applied_weapon_cache = {} -- Key: char GameObject Address, Value: state_hash
+-- 仅在准备重新开启 Mesh 时读取原生隐藏状态。非猎人对象沿用原行为；
+-- 猎人被原生隐藏且正在帐篷/临时换装时，不用预设强行显示。
+local function read_native_hunter_visibility(character)
+    local definition = character:get_type_definition()
+    if not definition then return false end
+    local name = definition:get_full_name()
+    if type(name) ~= "string" or name == "" then return false end
+    if name ~= "app.HunterCharacter" then return true end
+    local draw_off = character:call("get_IsDrawOff")
+    if draw_off == false then return true end
+    if draw_off ~= true then return false end
+    return character:call("get_IsInAllTent") == false
+end
+
+-- 读取失败仅拒绝这一次开启，不修改角色状态；下一次应用重新判断。
+local function native_hunter_allows_mesh_enable(character)
+    local ok, allowed = pcall(read_native_hunter_visibility, character)
+    return ok and allowed == true
+end
 
 -- 辅助函数：应用指定预设到指定角色的防具
 local function apply_preset_to_armor(character, preset_data, ignore_context, force_apply)
     if not character or not preset_data then return end
     -- 增加有效性检查，防止在对象销毁后访问
     if not sdk.is_managed_object(character) then return end
+    local native_enable_allowed -- 同次应用的各部位/多 Mesh 共用一次读取，不跨帧缓存。
     local char_go = safe_get_game_object(character, "apply_preset_armor")
     if not char_go then return end
     local char_addr = tostring(char_go)
@@ -1529,7 +1574,12 @@ local function apply_preset_to_armor(character, preset_data, ignore_context, for
                         if part_data.mesh_enabled == false then
                             if cur_en ~= false then mesh_component:call("set_Enabled", false) end
                         elseif part_data.mesh_enabled == true then
-                            if cur_en ~= true then mesh_component:call("set_Enabled", true) end
+                            if cur_en ~= true then
+                                if native_enable_allowed == nil then
+                                    native_enable_allowed = native_hunter_allows_mesh_enable(character)
+                                end
+                                if native_enable_allowed then mesh_component:call("set_Enabled", true) end
+                            end
                         end
                     end
                     -- 2. 应用材质开关
@@ -1562,6 +1612,7 @@ end
 local function apply_preset_to_weapon(character, weapon_objs, preset_data, ignore_context, force_apply)
     if not character or not weapon_objs or not preset_data then return end
     if not sdk.is_managed_object(character) then return end
+    local native_enable_allowed -- 武器与防具遵守相同的原生显隐限制。
     local char_go = safe_get_game_object(character, "apply_preset_weapon")
     if not char_go then return end
     local char_addr = tostring(char_go)
@@ -1596,7 +1647,12 @@ local function apply_preset_to_weapon(character, weapon_objs, preset_data, ignor
                              if part_data.mesh_enabled == false then
                                  if cur_en ~= false then mesh_component:call("set_Enabled", false) end
                              elseif part_data.mesh_enabled == true then
-                                 if cur_en ~= true then mesh_component:call("set_Enabled", true) end
+                                 if cur_en ~= true then
+                                     if native_enable_allowed == nil then
+                                         native_enable_allowed = native_hunter_allows_mesh_enable(character)
+                                     end
+                                     if native_enable_allowed then mesh_component:call("set_Enabled", true) end
+                                 end
                              end
                          end
                          -- 2. 应用材质开关
@@ -1850,6 +1906,8 @@ local function load_config_data(body_id)
         -- 补全默认值，导致"补全后数据 vs 原始备份"产生误差。
         detect_config_restored(body_id)
         -- 写入缓存
+        -- 迁移和默认节点补齐后判断实际目标；空默认节点不会启动条件监测。
+        TransformManager.refresh_config_rules(loaded_data)
         loaded_configs[body_id] = loaded_data
         return loaded_data
     end
@@ -2147,10 +2205,8 @@ local function apply_preset(preset_name)
             local char_weapon_id, w_objs = get_character_weapon_id(char)
             if char_weapon_id and char_weapon_id == current_body_id then
                 local config = load_config_data(char_weapon_id)
-                local char_go_ok, char_go = (function() local go = safe_get_game_object(char, "apply_preset_weapon_addr") if not go then return false end return true, go end)()
-                local char_addr = (char_go_ok and char_go) and tostring(char_go) or tostring(char)
-                local new_overrides, _ = TransformManager.apply_transform_rules(
-                    char_addr, config, char, active_overrides[current_body_id], merge_overrides
+                local new_overrides, _ = apply_transform_rules_for_character(
+                    config, char, active_overrides[current_body_id], merge_overrides
                 )
                 apply_preset_to_weapon(char, w_objs, new_overrides, true, true)
             end
@@ -2158,10 +2214,8 @@ local function apply_preset(preset_name)
             local char_body_id = get_character_body_id(char)
             if char_body_id and char_body_id == current_body_id then
                 local config = load_config_data(char_body_id)
-                local char_go_ok, char_go = (function() local go = safe_get_game_object(char, "apply_preset_armor_addr") if not go then return false end return true, go end)()
-                local char_addr = (char_go_ok and char_go) and tostring(char_go) or tostring(char)
-                local new_overrides, _, activated_targets = TransformManager.apply_transform_rules(
-                    char_addr, config, char, active_overrides[current_body_id], merge_overrides
+                local new_overrides, _, activated_targets = apply_transform_rules_for_character(
+                    config, char, active_overrides[current_body_id], merge_overrides
                 )
                 -- 检查变身规则是否激活了全局分组
                 local has_global_target = false
@@ -2281,6 +2335,8 @@ end
 -- 辅助函数：保存配置到文件
 local function save_current_config_to_file(body_id)
     if not body_id then return end
+    -- 新旧 UI 的规则、预设和分组修改都走此处，避免摘要在编辑后继续沿用旧结果。
+    TransformManager.refresh_config_rules(current_config)
     -- 更新缓存
     loaded_configs[body_id] = current_config
     local path = get_config_path(body_id)
@@ -2894,7 +2950,8 @@ end
 -- =============================================================================
 -- 新UI
 -- 基于原生 UI Runtime 的差分管理器界面。
-local variant_manager_ui = VariantManagerUI.new({
+variant_manager_ui = VariantManagerUI.new({
+    is_suspended = function() return runtime_guard.suspended end,
     config = global_config,
     translate = T,
     version = version,
@@ -3149,7 +3206,8 @@ local variant_manager_ui = VariantManagerUI.new({
 
     -- 为新 UI 提供当前条件状态，实际条件读取仍由 TransformManager 负责。
     get_transform_state = function(type_key, character)
-        if not character then return nil end
+        if not can_use_transform(character)
+            or not TransformManager.has_configured_condition(current_config, type_key) then return nil end
         if type_key == "damage" then
             -- 受击条件以角色地址维护倒计时，地址生成方式与旧 UI 保持一致。
             local ok, remaining = pcall(function()
@@ -3182,7 +3240,7 @@ local variant_manager_ui = VariantManagerUI.new({
 
     -- 生命值测试沿用旧 UI 的 TransformManager 写入接口，仅用于当前本地角色。
     set_test_hp = function(character, percent)
-        if not character then return false end
+        if not can_use_transform(character) then return false end
         local ok, result = pcall(function()
             return TransformManager.set_character_hp_percent(character, percent)
         end)
@@ -3426,16 +3484,13 @@ end
 -- 每一帧执行
 -- =============================================================================
 -- temp_applied_presets 已在文件头部定义
+runtime_guard:install_hooks()
 re.on_frame(function()
-    -- 0. 场景切换检测：在扫描器与缓存被使用前完成失效，避免对旧场景对象批量报错。
-    if scene_reset_pending then
-        flush_scene_reset()
-        scanner.last_scan_time = 0
-        scene_reset_pending = false
-    end
-
+    local suspended = runtime_guard:update()
+    variant_manager_ui:set_suspended(suspended)
+    if suspended then return end
     -- 0.1 执行分帧扫描器
-    tick_scanner()
+    if not tick_scanner() then variant_manager_ui:set_suspended(true); return end
 
     -- D2D 新 UI 自己维护快捷键按下沿和弹窗状态。
     variant_manager_ui:update()
@@ -3517,10 +3572,8 @@ re.on_frame(function()
             if config then
                 if not active_overrides[char_body_id] then
                     apply_all_defaults(char_body_id)
-                    local char_go_ok, char_go = (function() local go = safe_get_game_object(char, "ui_weapon_mesh") if not go then return false end return true, go end)()
-                    local char_addr = (char_go_ok and char_go) and tostring(char_go) or tostring(char)
-                    local new_overrides, _, activated_targets, all_targeted_groups = TransformManager.apply_transform_rules(
-                        char_addr, config, char, active_overrides[char_body_id], merge_overrides
+                    local new_overrides, _, activated_targets, all_targeted_groups = apply_transform_rules_for_character(
+                        config, char, active_overrides[char_body_id], merge_overrides
                     )
                     -- 同步变身规则激活的分组预设到 active_group_presets
                     -- 只对变身规则中实际涉及的全局分组做回退，未配置规则的全局分组保持用户手动选择
@@ -3551,11 +3604,9 @@ re.on_frame(function()
                 end
                 if active_overrides[char_body_id] then
                     if char and sdk.is_managed_object(char) then
-                        local char_go_ok, char_go = (function() local go = safe_get_game_object(char, "ui_part_mesh") if not go then return false end return true, go end)()
-                        local char_addr = (char_go_ok and char_go) and tostring(char_go) or tostring(char)
                         local final_overrides = active_overrides[char_body_id]
-                        local new_overrides, changed, activated_targets, all_targeted_groups = TransformManager.apply_transform_rules(
-                            char_addr, config, char, final_overrides, merge_overrides
+                        local new_overrides, changed, activated_targets, all_targeted_groups = apply_transform_rules_for_character(
+                            config, char, final_overrides, merge_overrides
                         )
                         -- 同步变身规则激活的分组预设到 active_group_presets
                         -- 只对变身规则中实际涉及的全局分组做回退，未配置规则的全局分组保持用户手动选择
@@ -3607,20 +3658,16 @@ re.on_frame(function()
             if config then
                 if not active_overrides[char_weapon_id] then
                     apply_all_defaults(char_weapon_id)
-                    local char_go_ok, char_go = (function() local go = safe_get_game_object(char, "ui_damage_test") if not go then return false end return true, go end)()
-                    local char_addr = (char_go_ok and char_go) and tostring(char_go) or tostring(char)
-                    local new_overrides, _ = TransformManager.apply_transform_rules(
-                        char_addr, config, char, active_overrides[char_weapon_id], merge_overrides
+                    local new_overrides, _ = apply_transform_rules_for_character(
+                        config, char, active_overrides[char_weapon_id], merge_overrides
                     )
                     apply_preset_to_weapon(char, w_objs, new_overrides, true, true)
                 end
                 if active_overrides[char_weapon_id] then
                     if char and sdk.is_managed_object(char) then
-                        local char_go_ok, char_go = (function() local go = safe_get_game_object(char, "ui_body_switch") if not go then return false end return true, go end)()
-                        local char_addr = (char_go_ok and char_go) and tostring(char_go) or tostring(char)
                         local final_overrides = active_overrides[char_weapon_id]
-                        local new_overrides, changed = TransformManager.apply_transform_rules(
-                            char_addr, config, char, final_overrides, merge_overrides
+                        local new_overrides, changed = apply_transform_rules_for_character(
+                            config, char, final_overrides, merge_overrides
                         )
                         
                         if changed then
@@ -3639,6 +3686,8 @@ end)
 -- =============================================================================
 -- UI 绘制回调
 re.on_draw_ui(function()
+    -- D2D与旧ImGui回调都读取同一状态，不在这里重复轮询游戏菜单/加载状态。
+    if runtime_guard.suspended then return end
     if imgui.tree_node(T("mod_name")) then
         imgui.text_colored(string.format(T("version") .. ": %s | " .. T("author") .. ": %s", version, author), 0xFF808080)
         imgui.separator()
@@ -4089,8 +4138,10 @@ re.on_draw_ui(function()
                     -- ========== 变身管理区域 ==========
                     if imgui.tree_node(T("transform_manager") .. " (" .. body_id .. ")") then
                         local inner_status, inner_err = pcall(function()
+                            if not can_use_transform(character) then imgui.text(T("transform_player_only_desc")); return end
                             -- 模块状态提示（选中条件或启用了该条件时才提示）
                             local function should_show_warning(type_key)
+                                if not TransformManager.has_configured_condition(current_config, type_key) then return false end
                                 if current_config.is_parallel then
                                     return current_config.parallel_settings and current_config.parallel_settings[type_key] and current_config.parallel_settings[type_key].enabled
                                 else
@@ -4244,7 +4295,7 @@ re.on_draw_ui(function()
                                            (current_config.is_parallel and current_config.parallel_settings.hp and current_config.parallel_settings.hp.enabled)
                             if show_hp then
                                 -- 当前生命值百分比展示 (调试用)
-                                local cur_hp = TransformManager.get_character_hp_percent(character)
+                                local cur_hp = TransformManager.get_configured_state(current_config, "hp", character)
                                 if cur_hp then
                                     imgui.text(string.format(T("cur_hp_percent"), cur_hp))
                                     imgui.set_next_item_width(80)
@@ -4307,7 +4358,7 @@ re.on_draw_ui(function()
                             local show_weapon = (not current_config.is_parallel and current_config.transform_type == "weapon") or
                                                (current_config.is_parallel and current_config.parallel_settings.weapon and current_config.parallel_settings.weapon.enabled)
                             if show_weapon then
-                                local is_drawn = TransformManager.get_character_weapon_drawn(character)
+                                local is_drawn = TransformManager.get_configured_state(current_config, "weapon", character)
                                 imgui.text((T("condition_weapon") or "Weapon State") .. ": " .. (is_drawn and T("weapon_drawn") or T("weapon_sheathed")))
                                 imgui.separator()
                                 if not current_config.weapon_transform_rules then
@@ -4342,7 +4393,7 @@ re.on_draw_ui(function()
                                     end
                                 end
 
-                                local remaining = TransformManager.get_damage_remaining_time(char_addr)
+                                local remaining = TransformManager.get_configured_state(current_config, "damage", character, char_addr) or 0
                                 if remaining > 0 then
                                     imgui.text_colored(string.format(T("damage_countdown") or "Countdown: %.1f s", remaining), 0xFF00A0FF)
                                 end
@@ -4442,7 +4493,7 @@ re.on_draw_ui(function()
                             local show_spirit = (not current_config.is_parallel and current_config.transform_type == "spirit") or
                                                (current_config.is_parallel and current_config.parallel_settings.spirit and current_config.parallel_settings.spirit.enabled)
                             if show_spirit then
-                                local current_level = TransformManager.get_character_spirit_level(character)
+                                local current_level = TransformManager.get_configured_state(current_config, "spirit", character)
                                 local level_text = current_level and tostring(current_level) or "?"
                                 imgui.text(T("spirit_level") .. ": " .. level_text)
                                 imgui.separator()
@@ -4467,7 +4518,7 @@ re.on_draw_ui(function()
                             local show_dual = (not current_config.is_parallel and current_config.transform_type == "dual_blades") or
                                              (current_config.is_parallel and current_config.parallel_settings.dual_blades and current_config.parallel_settings.dual_blades.enabled)
                             if show_dual then
-                                local cur_state = TransformManager.get_character_dual_blades_state(character)
+                                local cur_state = TransformManager.get_configured_state(current_config, "dual_blades", character)
                                 local state_text = ""
                                 if cur_state == "normal" then state_text = T("dual_normal")
                                 elseif cur_state == "kijin" then state_text = T("dual_kijin")
@@ -4494,7 +4545,7 @@ re.on_draw_ui(function()
                             local show_switch_axe = (not current_config.is_parallel and current_config.transform_type == "switch_axe") or
                                                    (current_config.is_parallel and current_config.parallel_settings.switch_axe and current_config.parallel_settings.switch_axe.enabled)
                             if show_switch_axe then
-                                local cur_state = TransformManager.get_character_switch_axe_state(character)
+                                local cur_state = TransformManager.get_configured_state(current_config, "switch_axe", character)
                                 local state_text = ""
                                 if cur_state == "sword_normal" then state_text = T("switch_axe_sword_normal")
                                 elseif cur_state == "sword_awakened" then state_text = T("switch_axe_sword_awakened")
@@ -4524,7 +4575,7 @@ re.on_draw_ui(function()
                             local show_insect_glaive = (not current_config.is_parallel and current_config.transform_type == "insect_glaive") or
                                                       (current_config.is_parallel and current_config.parallel_settings.insect_glaive and current_config.parallel_settings.insect_glaive.enabled)
                             if show_insect_glaive then
-                                local cur_state = TransformManager.get_character_insect_glaive_state(character)
+                                local cur_state = TransformManager.get_configured_state(current_config, "insect_glaive", character)
                                 local state_text = ""
                                 if cur_state == "none" then state_text = T("insect_glaive_none")
                                 elseif cur_state == "white" then state_text = T("insect_glaive_white")
@@ -4557,7 +4608,7 @@ re.on_draw_ui(function()
                             local show_charge_blade = (not current_config.is_parallel and current_config.transform_type == "charge_blade") or
                                                      (current_config.is_parallel and current_config.parallel_settings.charge_blade and current_config.parallel_settings.charge_blade.enabled)
                             if show_charge_blade then
-                                local cur_state = TransformManager.get_character_charge_blade_state(character)
+                                local cur_state = TransformManager.get_configured_state(current_config, "charge_blade", character)
                                 local state_text = ""
                                 if cur_state == "sword" then state_text = T("charge_blade_sword")
                                 elseif cur_state == "axe" then state_text = T("charge_blade_axe")
@@ -4596,7 +4647,7 @@ re.on_draw_ui(function()
                             local show_greatsword_type = (not current_config.is_parallel and current_config.transform_type == "greatsword_type") or
                                                         (current_config.is_parallel and current_config.parallel_settings.greatsword_type and current_config.parallel_settings.greatsword_type.enabled)
                             if show_greatsword_type then
-                                local cur_type = TransformManager.get_character_greatsword_charge_type(character)
+                                local cur_type = TransformManager.get_configured_state(current_config, "greatsword_type", character)
                                 local type_text = ""
                                 if cur_type == "0" then type_text = T("greatsword_type_0")
                                 elseif cur_type == "1" then type_text = T("greatsword_type_1")
@@ -4630,7 +4681,7 @@ re.on_draw_ui(function()
                             local show_greatsword_level = (not current_config.is_parallel and current_config.transform_type == "greatsword_level") or
                                                          (current_config.is_parallel and current_config.parallel_settings.greatsword_level and current_config.parallel_settings.greatsword_level.enabled)
                             if show_greatsword_level then
-                                local cur_level = TransformManager.get_character_greatsword_charge_level(character)
+                                local cur_level = TransformManager.get_configured_state(current_config, "greatsword_level", character)
                                 imgui.text(T("greatsword_level_current") .. ": " .. tostring(cur_level))
                                 imgui.separator()
                                 if not current_config.greatsword_level_transform_rules then
@@ -4650,7 +4701,7 @@ re.on_draw_ui(function()
                             local show_bow_level = (not current_config.is_parallel and current_config.transform_type == "bow_level") or
                                                   (current_config.is_parallel and current_config.parallel_settings.bow_level and current_config.parallel_settings.bow_level.enabled)
                             if show_bow_level then
-                                local cur_level = TransformManager.get_character_bow_charge_level(character)
+                                local cur_level = TransformManager.get_configured_state(current_config, "bow_level", character)
                                 local level_text = ""
                                 if cur_level == 1 then level_text = T("bow_level_1")
                                 elseif cur_level == 2 then level_text = T("bow_level_2")
@@ -4680,7 +4731,7 @@ re.on_draw_ui(function()
                             local show_hammer_level = (not current_config.is_parallel and current_config.transform_type == "hammer_level") or
                                                      (current_config.is_parallel and current_config.parallel_settings.hammer_level and current_config.parallel_settings.hammer_level.enabled)
                             if show_hammer_level then
-                                local cur_level = TransformManager.get_character_hammer_charge_level(character)
+                                local cur_level = TransformManager.get_configured_state(current_config, "hammer_level", character)
                                 local level_text = ""
                                 if cur_level == 0 then level_text = T("hammer_level_0")
                                 elseif cur_level == 1 then level_text = T("hammer_level_1")

@@ -1,5 +1,6 @@
 local Localization = {
     ["en"] = {
+        ["transform_player_only_desc"] = "Transformation conditions only run for the local and online players, not NPCs.",
         ["armor_mode"] = "Armor Variant",
         ["weapon_mode"] = "Weapon Variant",
         ["weapon_parts"] = "Current Weapon Parts",
@@ -267,6 +268,7 @@ local Localization = {
         ["d2d_default_tag"] = "Default"
     },
     ["zh"] = {
+        ["transform_player_only_desc"] = "变身条件仅用于本机及联机玩家，不对NPC执行。",
         ["armor_mode"] = "防具差分",
         ["weapon_mode"] = "武器差分",
         ["weapon_parts"] = "当前武器部件",
