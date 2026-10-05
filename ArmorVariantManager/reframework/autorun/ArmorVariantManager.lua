@@ -4138,7 +4138,7 @@ re.on_draw_ui(function()
                     -- ========== 变身管理区域 ==========
                     if imgui.tree_node(T("transform_manager") .. " (" .. body_id .. ")") then
                         local inner_status, inner_err = pcall(function()
-                            if not can_use_transform(character) then imgui.text(T("transform_player_only_desc")); return end
+                            if not can_use_transform(character) then return end
                             -- 模块状态提示（选中条件或启用了该条件时才提示）
                             local function should_show_warning(type_key)
                                 if not TransformManager.has_configured_condition(current_config, type_key) then return false end
