@@ -58,6 +58,108 @@ function TransformManager.get_character_weapon_type(character)
     return nil
 end
 local last_state_cache = {}
+local config_rule_cache = setmetatable({}, { __mode = "k" })
+local rule_fields = {
+    hp = "transform_rules",
+    damage = "damage_transform_rules",
+    weapon = "weapon_transform_rules",
+    spirit = "spirit_transform_rules",
+    dual_blades = "dual_blades_transform_rules",
+    switch_axe = "switch_axe_transform_rules",
+    insect_glaive = "insect_glaive_transform_rules",
+    charge_blade = "charge_blade_transform_rules",
+    greatsword_type = "greatsword_type_transform_rules",
+    greatsword_level = "greatsword_level_transform_rules",
+    bow_level = "bow_level_transform_rules",
+    hammer_level = "hammer_level_transform_rules"
+}
+local weapon_type_required = {
+    spirit = 3,           
+    dual_blades = 2,      
+    switch_axe = 8,       
+    insect_glaive = 10,   
+    charge_blade = 9,     
+    greatsword_type = 0,  
+    greatsword_level = 0, 
+    bow_level = 11,       
+    hammer_level = 4      
+}
+local function has_configured_target(config, targets)
+    if type(targets) ~= "table" then return false end
+    for _, target in ipairs(targets) do
+        if type(target) == "table" and type(target.preset) == "string"
+            and target.preset ~= "" and target.preset ~= "None" then
+            local group_name = target.group or ""
+            local owner = group_name == "" and config or
+                (type(config.groups) == "table" and config.groups[group_name])
+            if type(owner) == "table" and type(owner.presets) == "table"
+                and type(owner.presets[target.preset]) == "table" then
+                return true
+            end
+        end
+    end
+    return false
+end
+local function has_configured_rule(config, type_key, rule)
+    if type(rule) ~= "table" then return false end
+    if type_key == "damage" and rule.mode == 3 then
+        if type(rule.chain_nodes) ~= "table" then return false end
+        for _, node in pairs(rule.chain_nodes) do
+            if type(node) == "table" and has_configured_target(config, node.targets) then return true end
+        end
+        return false
+    end
+    return has_configured_target(config, rule.targets)
+end
+function TransformManager.refresh_config_rules(config)
+    if type(config) ~= "table" then return nil end
+    local summary = { conditions = {}, has_rules = false, needs_weapon_type = false }
+    for type_key, field in pairs(rule_fields) do
+        local setting = type(config.parallel_settings) == "table" and config.parallel_settings[type_key]
+        local enabled = config.is_parallel and type(setting) == "table" and setting.enabled
+            or not config.is_parallel and config.transform_type == type_key
+        local rules = config[field]
+        local configured = false
+        if enabled and type(rules) == "table" then
+            if type_key == "damage" then
+                for _, rule in pairs(rules) do
+                    configured = has_configured_rule(config, type_key, rule)
+                    break
+                end
+            else
+                for _, rule in ipairs(rules) do
+                    if has_configured_rule(config, type_key, rule) then configured = true; break end
+                end
+            end
+        end
+        if configured then
+            summary.conditions[type_key] = true
+            summary.has_rules = true
+            if weapon_type_required[type_key] ~= nil then summary.needs_weapon_type = true end
+        end
+    end
+    config_rule_cache[config] = summary
+    return summary
+end
+local function get_config_rules(config)
+    if type(config) ~= "table" then return nil end
+    return config_rule_cache[config] or TransformManager.refresh_config_rules(config)
+end
+function TransformManager.has_configured_rules(config)
+    local summary = get_config_rules(config)
+    return summary ~= nil and summary.has_rules
+end
+function TransformManager.has_configured_condition(config, type_key)
+    local summary = get_config_rules(config)
+    return summary ~= nil and summary.conditions[type_key] == true
+end
+function TransformManager.get_configured_state(config, type_key, character, char_addr)
+    if not TransformManager.has_configured_condition(config, type_key) then return nil end
+    if type_key == "damage" then return ConditionRegistry.damage.get_remaining_time(char_addr) end
+    local handler = ConditionRegistry[type_key]
+    if handler and handler.get_state then return handler.get_state(character) end
+    return nil
+end
 function TransformManager.clear_last_state_cache()
     last_state_cache = {}
 end
@@ -69,25 +171,18 @@ local function get_active_rule_for_type(t_type, config, character, char_addr)
     return nil, nil
 end
 function TransformManager.apply_transform_rules(char_addr, config, character, active_overrides, merge_overrides)
-    if not active_overrides then return active_overrides, false end
-    local weapon_type_required = {
-        spirit = 3,           
-        dual_blades = 2,      
-        switch_axe = 8,       
-        insect_glaive = 10,   
-        charge_blade = 9,     
-        greatsword_type = 0,  
-        greatsword_level = 0, 
-        bow_level = 11,       
-        hammer_level = 4,     
-    }
-    local current_weapon_type = TransformManager.get_character_weapon_type(character)
+    if not active_overrides then return active_overrides, false, nil, nil end
+    local summary = get_config_rules(config)
+    if not summary or not summary.has_rules then return active_overrides, false, nil, nil end
+    local current_weapon_type = nil
+    if summary.needs_weapon_type then
+        current_weapon_type = TransformManager.get_character_weapon_type(character)
+    end
     local active_rules = {} 
     local current_states = {} 
-    if not config then return active_overrides, false end
     if config.is_parallel then
         for t_type, p_setting in pairs(config.parallel_settings) do
-            if p_setting.enabled then
+            if summary.conditions[t_type] then
                 local required = weapon_type_required[t_type]
                 if required and current_weapon_type ~= required then
                     goto continue_parallel
@@ -102,7 +197,7 @@ function TransformManager.apply_transform_rules(char_addr, config, character, ac
         end
     else
         local t_type = config.transform_type
-        if t_type then
+        if summary.conditions[t_type] then
             local required = weapon_type_required[t_type]
             if not (required and current_weapon_type ~= required) then
                 local rule, cur_state = get_active_rule_for_type(t_type, config, character, char_addr)

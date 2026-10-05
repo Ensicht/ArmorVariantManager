@@ -1,6 +1,6 @@
 local mod_name = "ArmorVariantManager"
-local version = "4.2.2"
-local author = "MK,Moon,AZUSA"
+local version = "4.3.0"
+local author = "MK,Moon,AZUSA,Ensicht"
 local global_config_path = "ArmorVariantManager/GlobalSettings.json"
 local global_config = {
     language = "zh", 
@@ -13,6 +13,7 @@ local global_config = {
 }
 local Localization = require("ArmorVariantManager_Core.Localization")
 local TransformManager = require("ArmorVariantManager_Core.TransformManager")
+local RuntimeGuard = require("ArmorVariantManager_Core.RuntimeGuard")
 local refd2d_module_names = {
     "ArmorVariantManager_Core.UI.VariantManagerUI",
     "ArmorVariantManager_Core.Documentation",
@@ -163,6 +164,20 @@ local loaded_configs = {}
 local temp_applied_presets = {} 
 local active_overrides = {} 
 local active_group_presets = {}
+local transform_player_characters = {}
+local runtime_guard, variant_manager_ui
+local function can_use_transform(character)
+    return not runtime_guard.suspended and character ~= nil
+        and transform_player_characters[tostring(character)] == true
+end
+local function apply_transform_rules_for_character(config, character, overrides, merge_fn)
+    if not TransformManager.has_configured_rules(config) or not can_use_transform(character) then
+        return overrides, false, nil, nil
+    end
+    local game_object = safe_get_game_object(character, "transform_rules")
+    local char_addr = tostring(game_object or character)
+    return TransformManager.apply_transform_rules(char_addr, config, character, overrides, merge_fn)
+end
 local config_restored = {}
 local config_restore_handled = {}
 local parallel_condition_order = {
@@ -499,52 +514,50 @@ local function get_character_body_id(character)
     body_id_cache[cache_key] = { id = result_id, last_check = current_time }
     return result_id
 end
+local character_mesh_cache = {}
+local applied_parts_cache = {} 
+local applied_weapon_cache = {} 
 local character_cache = {} 
 local CACHE_TTL_BUFFER = 10.0 
-local current_scene_addr = nil
 local last_valid_local_player = nil 
 local last_valid_local_player_time = 0 
 local PLAYER_PERSISTENCE_TIME = 1.0 
-local SAFE_LIVENESS_BATCH_SIZE = 32 
-local scene_reset_pending = false 
 local scanner = {
     state = "IDLE", 
     transforms = nil, 
     count = 0,
     index = 1,
-    safe_batch_remaining = math.huge, 
+    scene_key = "",
+    generation = 0,
+    force_rescan = false,
     last_scan_time = 0
 }
-local function check_scene_change(scene)
-    local addr = scene and tostring(scene) or "none"
-    if addr == current_scene_addr then return false end
-    current_scene_addr = addr
+local function flush_scene_reset(reset_dead_marks)
     scanner.state = "IDLE"
     scanner.transforms = nil
     scanner.count = 0
     scanner.index = 1
-    scanner.safe_batch_remaining = math.huge
+    scanner.scene_key = ""
+    scanner.force_rescan = true
     character_cache = {}
     body_id_cache = {}
-    character_mesh_cache = {}
-    applied_parts_cache = {}
-    applied_weapon_cache = {}
-    loaded_configs = {}
-    last_valid_local_player = nil
-    scene_reset_pending = true
-    return true
-end
-local function flush_scene_reset()
-    character_cache = {}
-    body_id_cache = {}
+    weapon_id_cache = {}
     character_mesh_cache = {}
     applied_parts_cache = {}
     applied_weapon_cache = {}
     last_valid_local_player = nil
-    clear_dead_object_marks()
+    last_valid_local_player_time = 0
+    transform_player_characters = {}
+    if reset_dead_marks ~= false then clear_dead_object_marks() end
     if TransformManager and TransformManager.clear_last_state_cache then
         TransformManager.clear_last_state_cache()
     end
+    if variant_manager_ui then variant_manager_ui:invalidate_context() end
+end
+runtime_guard = RuntimeGuard.new(flush_scene_reset)
+local function discard_unreliable_scanner_snapshot()
+    flush_scene_reset(false)
+    runtime_guard:block_frame()
 end
 local function update_cache_entry(char)
     if not char then return end
@@ -558,22 +571,19 @@ local function update_cache_entry(char)
     if not string.find(body_id, "^ch03") then return end
     character_cache[key] = { char = char, last_seen = os.clock() }
 end
-local function tick_scanner()
+local function scan_scene_batch()
     local current_time = os.clock()
     local scan_interval = global_config.scan_interval or 2.0
     if scanner.state == "IDLE" then
-        if (current_time - scanner.last_scan_time > scan_interval) then
+        if scanner.force_rescan or (current_time - scanner.last_scan_time > scan_interval) then
+            scanner.force_rescan = false
             local ttl = global_config.body_id_ttl or 1.0
             for k, v in pairs(body_id_cache) do
                 if current_time - v.last_check > ttl * 2 then body_id_cache[k] = nil end
             end
-            local scene_manager = sdk.get_native_singleton("via.SceneManager")
-            local scene = nil
-            if scene_manager then
-                scene = sdk.call_native_func(scene_manager, sdk.find_type_definition("via.SceneManager"), "get_CurrentScene")
-            end
+            local scene, scene_key = runtime_guard:get_scene()
             if scene then
-                check_scene_change(scene)
+                if not runtime_guard:accept_scene(scene_key) then return false end
                 if type_cache.app_character then
                     local components = scene:call("findComponents(System.Type)", type_cache.app_character:get_runtime_type())
                     if components then
@@ -587,6 +597,8 @@ local function tick_scanner()
                         scanner.transforms = transforms:get_elements()
                         scanner.count = #scanner.transforms
                         scanner.index = 1
+                        scanner.scene_key = scene_key
+                        scanner.generation = runtime_guard.generation
                         scanner.state = "PROCESSING"
                     else
                         scanner.last_scan_time = current_time
@@ -599,14 +611,17 @@ local function tick_scanner()
             end
         end
     elseif scanner.state == "PROCESSING" then
-        local batch_size = global_config.scanner_batch_size or 100
-        if scanner.safe_batch_remaining <= 0 then
-            return
+        local _, scene_key = runtime_guard:get_scene()
+        if scanner.generation ~= runtime_guard.generation or scene_key == ""
+            or scanner.scene_key ~= scene_key then
+            runtime_guard:accept_scene(scene_key)
+            discard_unreliable_scanner_snapshot()
+            return false
         end
+        local batch_size = global_config.scanner_batch_size or 100
         local limit = scanner.index + batch_size - 1
         if limit > scanner.count then limit = scanner.count end
         local batch_dead = false
-        local processed = 0
         for i = scanner.index, limit do
             local safe_get_transform = function()
                 local t = scanner.transforms[i]
@@ -620,6 +635,10 @@ local function tick_scanner()
                     break
                 end
                 local name_ok, name = pcall(method_cache.GameObject_get_Name.call, method_cache.GameObject_get_Name, game_obj)
+                if not name_ok then
+                    batch_dead = true
+                    break
+                end
                 local is_target = false
                 if name_ok and name then
                     if string.sub(name, 1, 2) == "Pl" then
@@ -639,25 +658,25 @@ local function tick_scanner()
                     local char = nil
                     if type_cache.app_character then
                         local char_ok, c = pcall(method_cache.GameObject_getComponent.call, method_cache.GameObject_getComponent, game_obj, type_cache.app_character)
-                        if char_ok then char = c end
+                        if not char_ok then discard_unreliable_scanner_snapshot(); return false end
+                        char = c
                     end
                     if not char and type_cache.app_hunter_character then
                         local char_ok, c = pcall(method_cache.GameObject_getComponent.call, method_cache.GameObject_getComponent, game_obj, type_cache.app_hunter_character)
-                        if char_ok then char = c end
+                        if not char_ok then discard_unreliable_scanner_snapshot(); return false end
+                        char = c
                     end
                     if char then update_cache_entry(char) else update_cache_entry(transform) end
                 end
-                processed = processed + 1
+            else
+                batch_dead = true
+                break
             end
         end
-        if processed > 0 and scanner.safe_batch_remaining ~= math.huge then
-            scanner.safe_batch_remaining = scanner.safe_batch_remaining - processed
-        end
         if batch_dead then
-            scanner.safe_batch_remaining = 0
-            return
+            discard_unreliable_scanner_snapshot()
+            return false
         end
-        scanner.safe_batch_remaining = math.huge
         scanner.index = limit + 1
         if scanner.index > scanner.count then
             scanner.state = "IDLE"
@@ -665,8 +684,15 @@ local function tick_scanner()
             scanner.last_scan_time = os.clock()
         end
     end
+    return true
+end
+local function tick_scanner()
+    local ok, ready = pcall(scan_scene_batch)
+    if not ok then discard_unreliable_scanner_snapshot(); return false end
+    return ready
 end
 local function get_all_characters()
+    transform_player_characters = {}
     local chars = {}
     local seen_objs = {} 
     if not type_player_manager then type_player_manager = get_type("app.PlayerManager") end
@@ -679,6 +705,7 @@ local function get_all_characters()
                 if player then
                     local char = player:call("get_Character")
                     if char and sdk.is_managed_object(char) then
+                        transform_player_characters[tostring(char)] = true
                         local game_obj_ok, game_obj = (function() local go = safe_get_game_object(char, "get_all_characters_instanced") if not go then return false end return true, go end)()
                         if game_obj_ok and game_obj and sdk.is_managed_object(game_obj) then
                             local draw_status, is_draw = pcall(function() return game_obj:call("get_Draw") end)
@@ -701,6 +728,7 @@ local function get_all_characters()
         if master then
             local char = master:call("get_Character")
             if char and sdk.is_managed_object(char) then
+                transform_player_characters[tostring(char)] = true
                 local game_obj_ok, game_obj = (function() local go = safe_get_game_object(char, "get_all_characters_master") if not go then return false end return true, go end)()
                 if game_obj_ok and game_obj and sdk.is_managed_object(game_obj) then
                     local draw_status, is_draw = pcall(function() return game_obj:call("get_Draw") end)
@@ -746,7 +774,10 @@ local function get_local_player_character()
     local player_manager = get_player_manager()
     if player_manager then
         local master_player = player_manager:call("getMasterPlayer")
-        if master_player then char = master_player:call("get_Character") end
+        if master_player then
+            char = master_player:call("get_Character")
+            if char and sdk.is_managed_object(char) then transform_player_characters[tostring(char)] = true end
+        end
     end
     if not char then
         local all_chars = get_all_characters()
@@ -963,7 +994,6 @@ local function is_player_face_object(game_obj)
     local ok_name, name = pcall(function() return game_obj:call("get_Name") end)
     return ok_name and name == "Player_Face"
 end
-local character_mesh_cache = {}
 local CHARACTER_MESH_CACHE_TTL = 0.25
 local function get_all_character_meshes(character)
     if not character or not sdk.is_managed_object(character) then return {} end
@@ -1167,11 +1197,25 @@ local function is_globally_hidden(part_index, mat_name)
     end
     return false
 end
-local applied_parts_cache = {} 
-local applied_weapon_cache = {} 
+local function read_native_hunter_visibility(character)
+    local definition = character:get_type_definition()
+    if not definition then return false end
+    local name = definition:get_full_name()
+    if type(name) ~= "string" or name == "" then return false end
+    if name ~= "app.HunterCharacter" then return true end
+    local draw_off = character:call("get_IsDrawOff")
+    if draw_off == false then return true end
+    if draw_off ~= true then return false end
+    return character:call("get_IsInAllTent") == false
+end
+local function native_hunter_allows_mesh_enable(character)
+    local ok, allowed = pcall(read_native_hunter_visibility, character)
+    return ok and allowed == true
+end
 local function apply_preset_to_armor(character, preset_data, ignore_context, force_apply)
     if not character or not preset_data then return end
     if not sdk.is_managed_object(character) then return end
+    local native_enable_allowed 
     local char_go = safe_get_game_object(character, "apply_preset_armor")
     if not char_go then return end
     local char_addr = tostring(char_go)
@@ -1195,7 +1239,12 @@ local function apply_preset_to_armor(character, preset_data, ignore_context, for
                         if part_data.mesh_enabled == false then
                             if cur_en ~= false then mesh_component:call("set_Enabled", false) end
                         elseif part_data.mesh_enabled == true then
-                            if cur_en ~= true then mesh_component:call("set_Enabled", true) end
+                            if cur_en ~= true then
+                                if native_enable_allowed == nil then
+                                    native_enable_allowed = native_hunter_allows_mesh_enable(character)
+                                end
+                                if native_enable_allowed then mesh_component:call("set_Enabled", true) end
+                            end
                         end
                     end
                     if part_data.materials and mat_count > 0 then
@@ -1223,6 +1272,7 @@ end
 local function apply_preset_to_weapon(character, weapon_objs, preset_data, ignore_context, force_apply)
     if not character or not weapon_objs or not preset_data then return end
     if not sdk.is_managed_object(character) then return end
+    local native_enable_allowed 
     local char_go = safe_get_game_object(character, "apply_preset_weapon")
     if not char_go then return end
     local char_addr = tostring(char_go)
@@ -1250,7 +1300,12 @@ local function apply_preset_to_weapon(character, weapon_objs, preset_data, ignor
                              if part_data.mesh_enabled == false then
                                  if cur_en ~= false then mesh_component:call("set_Enabled", false) end
                              elseif part_data.mesh_enabled == true then
-                                 if cur_en ~= true then mesh_component:call("set_Enabled", true) end
+                                 if cur_en ~= true then
+                                     if native_enable_allowed == nil then
+                                         native_enable_allowed = native_hunter_allows_mesh_enable(character)
+                                     end
+                                     if native_enable_allowed then mesh_component:call("set_Enabled", true) end
+                                 end
                              end
                          end
                          if part_data.materials and mat_count > 0 then
@@ -1465,6 +1520,7 @@ local function load_config_data(body_id)
             }
         end
         detect_config_restored(body_id)
+        TransformManager.refresh_config_rules(loaded_data)
         loaded_configs[body_id] = loaded_data
         return loaded_data
     end
@@ -1709,10 +1765,8 @@ local function apply_preset(preset_name)
             local char_weapon_id, w_objs = get_character_weapon_id(char)
             if char_weapon_id and char_weapon_id == current_body_id then
                 local config = load_config_data(char_weapon_id)
-                local char_go_ok, char_go = (function() local go = safe_get_game_object(char, "apply_preset_weapon_addr") if not go then return false end return true, go end)()
-                local char_addr = (char_go_ok and char_go) and tostring(char_go) or tostring(char)
-                local new_overrides, _ = TransformManager.apply_transform_rules(
-                    char_addr, config, char, active_overrides[current_body_id], merge_overrides
+                local new_overrides, _ = apply_transform_rules_for_character(
+                    config, char, active_overrides[current_body_id], merge_overrides
                 )
                 apply_preset_to_weapon(char, w_objs, new_overrides, true, true)
             end
@@ -1720,10 +1774,8 @@ local function apply_preset(preset_name)
             local char_body_id = get_character_body_id(char)
             if char_body_id and char_body_id == current_body_id then
                 local config = load_config_data(char_body_id)
-                local char_go_ok, char_go = (function() local go = safe_get_game_object(char, "apply_preset_armor_addr") if not go then return false end return true, go end)()
-                local char_addr = (char_go_ok and char_go) and tostring(char_go) or tostring(char)
-                local new_overrides, _, activated_targets = TransformManager.apply_transform_rules(
-                    char_addr, config, char, active_overrides[current_body_id], merge_overrides
+                local new_overrides, _, activated_targets = apply_transform_rules_for_character(
+                    config, char, active_overrides[current_body_id], merge_overrides
                 )
                 local has_global_target = false
                 if activated_targets and config and config.groups then
@@ -1833,6 +1885,7 @@ local function load_body_config(body_id)
 end
 local function save_current_config_to_file(body_id)
     if not body_id then return end
+    TransformManager.refresh_config_rules(current_config)
     loaded_configs[body_id] = current_config
     local path = get_config_path(body_id)
     safe_json_save(path, current_config)
@@ -2351,7 +2404,8 @@ local function draw_mesh_toggle(game_object, label, body_id, part_index)
         imgui.text_colored(label .. " " .. T("no_mesh"), 0xFF808080)
     end
 end
-local variant_manager_ui = VariantManagerUI.new({
+variant_manager_ui = VariantManagerUI.new({
+    is_suspended = function() return runtime_guard.suspended end,
     config = global_config,
     translate = T,
     version = version,
@@ -2562,7 +2616,8 @@ local variant_manager_ui = VariantManagerUI.new({
         if body_id then save_current_config_to_file(body_id) end
     end,
     get_transform_state = function(type_key, character)
-        if not character then return nil end
+        if not can_use_transform(character)
+            or not TransformManager.has_configured_condition(current_config, type_key) then return nil end
         if type_key == "damage" then
             local ok, remaining = pcall(function()
                 local game_object = safe_get_game_object(character, "transform_state_damage")
@@ -2591,7 +2646,7 @@ local variant_manager_ui = VariantManagerUI.new({
         return nil
     end,
     set_test_hp = function(character, percent)
-        if not character then return false end
+        if not can_use_transform(character) then return false end
         local ok, result = pcall(function()
             return TransformManager.set_character_hp_percent(character, percent)
         end)
@@ -2793,13 +2848,12 @@ local function draw_targets_ui(targets, rule_type, rule_idx)
         imgui.pop_id()
     end
 end
+runtime_guard:install_hooks()
 re.on_frame(function()
-    if scene_reset_pending then
-        flush_scene_reset()
-        scanner.last_scan_time = 0
-        scene_reset_pending = false
-    end
-    tick_scanner()
+    local suspended = runtime_guard:update()
+    variant_manager_ui:set_suspended(suspended)
+    if suspended then return end
+    if not tick_scanner() then variant_manager_ui:set_suspended(true); return end
     variant_manager_ui:update()
     local local_body_id = get_body_id()
     if local_body_id then
@@ -2863,10 +2917,8 @@ re.on_frame(function()
             if config then
                 if not active_overrides[char_body_id] then
                     apply_all_defaults(char_body_id)
-                    local char_go_ok, char_go = (function() local go = safe_get_game_object(char, "ui_weapon_mesh") if not go then return false end return true, go end)()
-                    local char_addr = (char_go_ok and char_go) and tostring(char_go) or tostring(char)
-                    local new_overrides, _, activated_targets, all_targeted_groups = TransformManager.apply_transform_rules(
-                        char_addr, config, char, active_overrides[char_body_id], merge_overrides
+                    local new_overrides, _, activated_targets, all_targeted_groups = apply_transform_rules_for_character(
+                        config, char, active_overrides[char_body_id], merge_overrides
                     )
                     if not active_group_presets[char_body_id] then active_group_presets[char_body_id] = {} end
                     local has_global_target = false
@@ -2892,11 +2944,9 @@ re.on_frame(function()
                 end
                 if active_overrides[char_body_id] then
                     if char and sdk.is_managed_object(char) then
-                        local char_go_ok, char_go = (function() local go = safe_get_game_object(char, "ui_part_mesh") if not go then return false end return true, go end)()
-                        local char_addr = (char_go_ok and char_go) and tostring(char_go) or tostring(char)
                         local final_overrides = active_overrides[char_body_id]
-                        local new_overrides, changed, activated_targets, all_targeted_groups = TransformManager.apply_transform_rules(
-                            char_addr, config, char, final_overrides, merge_overrides
+                        local new_overrides, changed, activated_targets, all_targeted_groups = apply_transform_rules_for_character(
+                            config, char, final_overrides, merge_overrides
                         )
                         if not active_group_presets[char_body_id] then active_group_presets[char_body_id] = {} end
                         local has_global_target = false
@@ -2937,20 +2987,16 @@ re.on_frame(function()
             if config then
                 if not active_overrides[char_weapon_id] then
                     apply_all_defaults(char_weapon_id)
-                    local char_go_ok, char_go = (function() local go = safe_get_game_object(char, "ui_damage_test") if not go then return false end return true, go end)()
-                    local char_addr = (char_go_ok and char_go) and tostring(char_go) or tostring(char)
-                    local new_overrides, _ = TransformManager.apply_transform_rules(
-                        char_addr, config, char, active_overrides[char_weapon_id], merge_overrides
+                    local new_overrides, _ = apply_transform_rules_for_character(
+                        config, char, active_overrides[char_weapon_id], merge_overrides
                     )
                     apply_preset_to_weapon(char, w_objs, new_overrides, true, true)
                 end
                 if active_overrides[char_weapon_id] then
                     if char and sdk.is_managed_object(char) then
-                        local char_go_ok, char_go = (function() local go = safe_get_game_object(char, "ui_body_switch") if not go then return false end return true, go end)()
-                        local char_addr = (char_go_ok and char_go) and tostring(char_go) or tostring(char)
                         local final_overrides = active_overrides[char_weapon_id]
-                        local new_overrides, changed = TransformManager.apply_transform_rules(
-                            char_addr, config, char, final_overrides, merge_overrides
+                        local new_overrides, changed = apply_transform_rules_for_character(
+                            config, char, final_overrides, merge_overrides
                         )
                         if changed then
                             apply_preset_to_weapon(char, w_objs, new_overrides, true, true)
@@ -2964,6 +3010,7 @@ re.on_frame(function()
     end
 end)
 re.on_draw_ui(function()
+    if runtime_guard.suspended then return end
     if imgui.tree_node(T("mod_name")) then
         imgui.text_colored(string.format(T("version") .. ": %s | " .. T("author") .. ": %s", version, author), 0xFF808080)
         imgui.separator()
@@ -3357,7 +3404,9 @@ re.on_draw_ui(function()
                     imgui.separator()
                     if imgui.tree_node(T("transform_manager") .. " (" .. body_id .. ")") then
                         local inner_status, inner_err = pcall(function()
+                            if not can_use_transform(character) then return end
                             local function should_show_warning(type_key)
+                                if not TransformManager.has_configured_condition(current_config, type_key) then return false end
                                 if current_config.is_parallel then
                                     return current_config.parallel_settings and current_config.parallel_settings[type_key] and current_config.parallel_settings[type_key].enabled
                                 else
@@ -3500,7 +3549,7 @@ re.on_draw_ui(function()
                             local show_hp = (not current_config.is_parallel and current_config.transform_type == "hp") or
                                            (current_config.is_parallel and current_config.parallel_settings.hp and current_config.parallel_settings.hp.enabled)
                             if show_hp then
-                                local cur_hp = TransformManager.get_character_hp_percent(character)
+                                local cur_hp = TransformManager.get_configured_state(current_config, "hp", character)
                                 if cur_hp then
                                     imgui.text(string.format(T("cur_hp_percent"), cur_hp))
                                     imgui.set_next_item_width(80)
@@ -3557,7 +3606,7 @@ re.on_draw_ui(function()
                             local show_weapon = (not current_config.is_parallel and current_config.transform_type == "weapon") or
                                                (current_config.is_parallel and current_config.parallel_settings.weapon and current_config.parallel_settings.weapon.enabled)
                             if show_weapon then
-                                local is_drawn = TransformManager.get_character_weapon_drawn(character)
+                                local is_drawn = TransformManager.get_configured_state(current_config, "weapon", character)
                                 imgui.text((T("condition_weapon") or "Weapon State") .. ": " .. (is_drawn and T("weapon_drawn") or T("weapon_sheathed")))
                                 imgui.separator()
                                 if not current_config.weapon_transform_rules then
@@ -3587,7 +3636,7 @@ re.on_draw_ui(function()
                                         TransformManager.set_character_hp(character, cur_hp - 25)
                                     end
                                 end
-                                local remaining = TransformManager.get_damage_remaining_time(char_addr)
+                                local remaining = TransformManager.get_configured_state(current_config, "damage", character, char_addr) or 0
                                 if remaining > 0 then
                                     imgui.text_colored(string.format(T("damage_countdown") or "Countdown: %.1f s", remaining), 0xFF00A0FF)
                                 end
@@ -3672,7 +3721,7 @@ re.on_draw_ui(function()
                             local show_spirit = (not current_config.is_parallel and current_config.transform_type == "spirit") or
                                                (current_config.is_parallel and current_config.parallel_settings.spirit and current_config.parallel_settings.spirit.enabled)
                             if show_spirit then
-                                local current_level = TransformManager.get_character_spirit_level(character)
+                                local current_level = TransformManager.get_configured_state(current_config, "spirit", character)
                                 local level_text = current_level and tostring(current_level) or "?"
                                 imgui.text(T("spirit_level") .. ": " .. level_text)
                                 imgui.separator()
@@ -3695,7 +3744,7 @@ re.on_draw_ui(function()
                             local show_dual = (not current_config.is_parallel and current_config.transform_type == "dual_blades") or
                                              (current_config.is_parallel and current_config.parallel_settings.dual_blades and current_config.parallel_settings.dual_blades.enabled)
                             if show_dual then
-                                local cur_state = TransformManager.get_character_dual_blades_state(character)
+                                local cur_state = TransformManager.get_configured_state(current_config, "dual_blades", character)
                                 local state_text = ""
                                 if cur_state == "normal" then state_text = T("dual_normal")
                                 elseif cur_state == "kijin" then state_text = T("dual_kijin")
@@ -3720,7 +3769,7 @@ re.on_draw_ui(function()
                             local show_switch_axe = (not current_config.is_parallel and current_config.transform_type == "switch_axe") or
                                                    (current_config.is_parallel and current_config.parallel_settings.switch_axe and current_config.parallel_settings.switch_axe.enabled)
                             if show_switch_axe then
-                                local cur_state = TransformManager.get_character_switch_axe_state(character)
+                                local cur_state = TransformManager.get_configured_state(current_config, "switch_axe", character)
                                 local state_text = ""
                                 if cur_state == "sword_normal" then state_text = T("switch_axe_sword_normal")
                                 elseif cur_state == "sword_awakened" then state_text = T("switch_axe_sword_awakened")
@@ -3748,7 +3797,7 @@ re.on_draw_ui(function()
                             local show_insect_glaive = (not current_config.is_parallel and current_config.transform_type == "insect_glaive") or
                                                       (current_config.is_parallel and current_config.parallel_settings.insect_glaive and current_config.parallel_settings.insect_glaive.enabled)
                             if show_insect_glaive then
-                                local cur_state = TransformManager.get_character_insect_glaive_state(character)
+                                local cur_state = TransformManager.get_configured_state(current_config, "insect_glaive", character)
                                 local state_text = ""
                                 if cur_state == "none" then state_text = T("insect_glaive_none")
                                 elseif cur_state == "white" then state_text = T("insect_glaive_white")
@@ -3779,7 +3828,7 @@ re.on_draw_ui(function()
                             local show_charge_blade = (not current_config.is_parallel and current_config.transform_type == "charge_blade") or
                                                      (current_config.is_parallel and current_config.parallel_settings.charge_blade and current_config.parallel_settings.charge_blade.enabled)
                             if show_charge_blade then
-                                local cur_state = TransformManager.get_character_charge_blade_state(character)
+                                local cur_state = TransformManager.get_configured_state(current_config, "charge_blade", character)
                                 local state_text = ""
                                 if cur_state == "sword" then state_text = T("charge_blade_sword")
                                 elseif cur_state == "axe" then state_text = T("charge_blade_axe")
@@ -3816,7 +3865,7 @@ re.on_draw_ui(function()
                             local show_greatsword_type = (not current_config.is_parallel and current_config.transform_type == "greatsword_type") or
                                                         (current_config.is_parallel and current_config.parallel_settings.greatsword_type and current_config.parallel_settings.greatsword_type.enabled)
                             if show_greatsword_type then
-                                local cur_type = TransformManager.get_character_greatsword_charge_type(character)
+                                local cur_type = TransformManager.get_configured_state(current_config, "greatsword_type", character)
                                 local type_text = ""
                                 if cur_type == "0" then type_text = T("greatsword_type_0")
                                 elseif cur_type == "1" then type_text = T("greatsword_type_1")
@@ -3848,7 +3897,7 @@ re.on_draw_ui(function()
                             local show_greatsword_level = (not current_config.is_parallel and current_config.transform_type == "greatsword_level") or
                                                          (current_config.is_parallel and current_config.parallel_settings.greatsword_level and current_config.parallel_settings.greatsword_level.enabled)
                             if show_greatsword_level then
-                                local cur_level = TransformManager.get_character_greatsword_charge_level(character)
+                                local cur_level = TransformManager.get_configured_state(current_config, "greatsword_level", character)
                                 imgui.text(T("greatsword_level_current") .. ": " .. tostring(cur_level))
                                 imgui.separator()
                                 if not current_config.greatsword_level_transform_rules then
@@ -3866,7 +3915,7 @@ re.on_draw_ui(function()
                             local show_bow_level = (not current_config.is_parallel and current_config.transform_type == "bow_level") or
                                                   (current_config.is_parallel and current_config.parallel_settings.bow_level and current_config.parallel_settings.bow_level.enabled)
                             if show_bow_level then
-                                local cur_level = TransformManager.get_character_bow_charge_level(character)
+                                local cur_level = TransformManager.get_configured_state(current_config, "bow_level", character)
                                 local level_text = ""
                                 if cur_level == 1 then level_text = T("bow_level_1")
                                 elseif cur_level == 2 then level_text = T("bow_level_2")
@@ -3894,7 +3943,7 @@ re.on_draw_ui(function()
                             local show_hammer_level = (not current_config.is_parallel and current_config.transform_type == "hammer_level") or
                                                      (current_config.is_parallel and current_config.parallel_settings.hammer_level and current_config.parallel_settings.hammer_level.enabled)
                             if show_hammer_level then
-                                local cur_level = TransformManager.get_character_hammer_charge_level(character)
+                                local cur_level = TransformManager.get_configured_state(current_config, "hammer_level", character)
                                 local level_text = ""
                                 if cur_level == 0 then level_text = T("hammer_level_0")
                                 elseif cur_level == 1 then level_text = T("hammer_level_1")

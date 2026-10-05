@@ -1,6 +1,29 @@
 local Runtime = {}
 Runtime.ui_scale = 1
 Runtime.frame_input = nil
+local input_sampled = false
+local mouse_was_down = false
+local pending_clicks = {}
+local click_head, click_tail = 1, 0
+function Runtime.reset_pending_input()
+    if click_tail > 0 then pending_clicks = {} end
+    click_head, click_tail = 1, 0
+    input_sampled, mouse_was_down = false, false
+    Runtime.frame_input = nil
+end
+function Runtime.capture_input()
+    local down_ok, down = pcall(function() return imgui.is_mouse_down(0) end)
+    down = down_ok and down == true
+    local clicked_ok, clicked = pcall(function() return imgui.is_mouse_clicked(0) end)
+    if input_sampled and ((clicked_ok and clicked == true) or (down and not mouse_was_down)) then
+        local x, y = Runtime.raw_mouse_position()
+        if x >= 0 and y >= 0 then
+            click_tail = click_tail + 1
+            pending_clicks[click_tail] = { x = x, y = y }
+        end
+    end
+    input_sampled, mouse_was_down = true, down
+end
 function Runtime.set_ui_scale(scale)
     Runtime.ui_scale = math.max(0.01, tonumber(scale) or 1)
 end
@@ -75,14 +98,28 @@ function Runtime.begin_input_frame()
     local raw_x, raw_y = Runtime.raw_mouse_position()
     local mouse_x, mouse_y = Runtime.mouse_position()
     local down_ok, down = pcall(function() return imgui.is_mouse_down(0) end)
-    local clicked_ok, clicked = pcall(function() return imgui.is_mouse_clicked(0) end)
+    local clicked = false
+    if input_sampled then
+        local event = pending_clicks[click_head]
+        if event then
+            pending_clicks[click_head] = nil
+            click_head = click_head + 1
+            raw_x, raw_y = event.x, event.y
+            mouse_x, mouse_y = Runtime.to_logical_point(raw_x, raw_y)
+            clicked = true
+            if click_head > click_tail then click_head, click_tail = 1, 0 end
+        end
+    else
+        local clicked_ok, value = pcall(function() return imgui.is_mouse_clicked(0) end)
+        clicked = clicked_ok and value == true
+    end
     Runtime.frame_input = {
         raw_x = raw_x,
         raw_y = raw_y,
         mouse_x = mouse_x,
         mouse_y = mouse_y,
         mouse_down = down_ok and down == true or false,
-        mouse_clicked = clicked_ok and clicked == true or false
+        mouse_clicked = clicked
     }
 end
 function Runtime.end_input_frame()
